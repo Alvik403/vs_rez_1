@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Консолидация резервов</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <div class="upload-wrap">
+        <form id="uploadForm" class="card" method="post" enctype="multipart/form-data">
+          <label class="dropzone">
+            <input id="files" name="files" type="file" accept=".xlsx,.xlsm" multiple required />
+            <strong>Файлы вскрытия резервов</strong>
+            <span>Можно выбрать сразу несколько `.xlsx` или `.xlsm`.</span>
+          </label>
+
+          <div class="actions">
+            <button id="submitButton" type="submit">Собрать и скачать</button>
+            <p id="status" class="status">Файлы пока не выбраны.</p>
+          </div>
+
+          <div id="fileList" class="file-list"></div>
+        </form>
+      </div>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
