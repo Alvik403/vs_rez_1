@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import os
 from collections.abc import Iterator
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -20,6 +23,56 @@ _NO_STORE = {
 }
 
 _STREAM_CHUNK = 256 * 1024
+
+
+def _parse_worker_count() -> int:
+    raw = os.getenv("RESERVE_PARSE_WORKERS")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return max(1, min(2, os.cpu_count() or 1))
+
+
+_PARSE_WORKERS = _parse_worker_count()
+_PARSE_POOL: ProcessPoolExecutor | None = (
+    ProcessPoolExecutor(max_workers=_PARSE_WORKERS) if _PARSE_WORKERS > 1 else None
+)
+
+
+def _parse_uploaded_excel(item: tuple[str, bytes]) -> ParsedFile:
+    filename, content = item
+    return parse_reserve_workbook(content, filename)
+
+
+async def _parse_excel_files(items: list[tuple[str, bytes]]) -> tuple[list[ParsedFile], list[str]]:
+    if not items:
+        return [], []
+
+    if _PARSE_POOL is None or len(items) == 1:
+        parsed: list[ParsedFile] = []
+        errors: list[str] = []
+        for filename, content in items:
+            try:
+                parsed.append(parse_reserve_workbook(content, filename))
+            except Exception as exc:
+                errors.append(str(exc))
+        return parsed, errors
+
+    loop = asyncio.get_running_loop()
+    tasks = [loop.run_in_executor(_PARSE_POOL, _parse_uploaded_excel, item) for item in items]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    parsed = []
+    errors = []
+    for (filename, _content), result in zip(items, results, strict=True):
+        if isinstance(result, Exception):
+            errors.append(f"{filename}: {result}")
+        else:
+            parsed.append(result)
+
+    return parsed, errors
 
 
 def _iter_excel_bytes(payload: bytes) -> Iterator[bytes]:
@@ -42,6 +95,12 @@ app = FastAPI(title="Консолидация резервов")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
 
+@app.on_event("shutdown")
+def shutdown_parse_pool() -> None:
+    if _PARSE_POOL is not None:
+        _PARSE_POOL.shutdown(cancel_futures=True)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index() -> HTMLResponse:
     body = (BASE_DIR / "templates" / "index.html").read_text(encoding="utf-8")
@@ -53,7 +112,7 @@ async def process_files(files: list[UploadFile] = File(...)) -> StreamingRespons
     if not files:
         raise HTTPException(status_code=400, detail="Загрузите хотя бы один файл .xlsx или .xlsm.")
 
-    parsed_files: list[ParsedFile] = []
+    upload_items: list[tuple[str, bytes]] = []
     errors: list[str] = []
 
     for uploaded in files:
@@ -61,12 +120,11 @@ async def process_files(files: list[UploadFile] = File(...)) -> StreamingRespons
             errors.append(f"{uploaded.filename}: неподдерживаемый формат")
             continue
         content = await uploaded.read()
-        try:
-            parsed_files.append(parse_reserve_workbook(content, uploaded.filename))
-        except Exception as exc:
-            errors.append(str(exc))
-        finally:
-            del content
+        upload_items.append((uploaded.filename, content))
+
+    parsed_files, parse_errors = await _parse_excel_files(upload_items)
+    errors.extend(parse_errors)
+    upload_items.clear()
 
     if not parsed_files:
         raise HTTPException(status_code=400, detail="Не удалось прочитать файлы. " + "; ".join(errors))

@@ -425,6 +425,7 @@ BLK = "FF000000"
 SIDE_M = Side(style="medium", color=BLK)
 SIDE_T = Side(style="thin", color=BLK)
 SIDE_H = Side(style="hair", color=BLK)
+SIDE_THICK = Side(style="thick", color=BLK)
 NO_BORDER = Border()
 FILL_HEADER = PatternFill(patternType="solid", fgColor="FFD9D9D9")
 FILL_EMPTY = PatternFill(fill_type=None)
@@ -449,7 +450,34 @@ FONT_HDR = Font(name=FONT_TNR, size=12, bold=True, color="FF000000")
 FONT_DATA = Font(name=FONT_TNR, size=11, bold=False, color="FF000000")
 FONT_DATA_BOLD = Font(name=FONT_TNR, size=11, bold=True, color="FF000000")
 
+# Пробел как разделитель групп разрядов, запятая — десятичная; «00» — всегда две дробные цифры
 NUM_FMT_RU = "# ##0,00"
+
+
+def _outline_thick_box(sheet: Worksheet, r1: int, r2: int, c1: int, c2: int) -> None:
+    """Только контур блока (верх/низ/лево/право), без линий между ячейками внутри."""
+    for r in range(r1, r2 + 1):
+        for c in range(c1, c2 + 1):
+            top = SIDE_THICK if r == r1 else None
+            bottom = SIDE_THICK if r == r2 else None
+            left = SIDE_THICK if c == c1 else None
+            right = SIDE_THICK if c == c2 else None
+            sheet.cell(row=r, column=c).border = Border(top=top, bottom=bottom, left=left, right=right)
+
+
+def _set_block_perimeter_thick(sheet: Worksheet, r1: int, r2: int, c1: int, c2: int) -> None:
+    """Жирный внешний контур, внутренние границы строк/столбцов сохраняются (таблица детализации)."""
+    for r in range(r1, r2 + 1):
+        for c in range(c1, c2 + 1):
+            cell = sheet.cell(row=r, column=c)
+            b = cell.border
+            left = SIDE_THICK if c == c1 else b.left
+            right = SIDE_THICK if c == c2 else b.right
+            top = SIDE_THICK if r == r1 else b.top
+            bottom = SIDE_THICK if r == r2 else b.bottom
+            cell.border = Border(left=left, right=right, top=top, bottom=bottom)
+
+
 ALIGN_LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
 ALIGN_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 ALIGN_RIGHT = Alignment(horizontal="right", vertical="center", wrap_text=True)
@@ -459,15 +487,13 @@ COMMENT_COL_WIDTH = 52.0
 
 
 def style_summary_block_headers(sheet: Worksheet, row: int, start_col: int, end_col: int) -> None:
-    """Верхняя строка сводки."""
+    """Верхняя строка сводки; границы блока — отдельно контуром (_outline_thick_box)."""
     for col in range(start_col, end_col + 1):
         cell = sheet.cell(row=row, column=col)
         cell.fill = FILL_HEADER
         cell.font = FONT_HDR
         cell.alignment = ALIGN_CENTER
-        left = SIDE_M if col == start_col else SIDE_T
-        right = SIDE_M if col == end_col else SIDE_T
-        cell.border = Border(left=left, right=right, top=SIDE_M, bottom=SIDE_T)
+        cell.border = NO_BORDER
 
 
 def style_summary_reserve_subheader(sheet: Worksheet, row: int, start_col: int, end_col: int) -> None:
@@ -477,9 +503,7 @@ def style_summary_reserve_subheader(sheet: Worksheet, row: int, start_col: int, 
         cell.fill = FILL_HEADER
         cell.font = FONT_HDR
         cell.alignment = ALIGN_CENTER
-        left = SIDE_M if col == start_col else SIDE_T
-        right = SIDE_M if col == end_col else SIDE_T
-        cell.border = Border(left=left, right=right, top=SIDE_T, bottom=SIDE_T)
+        cell.border = NO_BORDER
 
 
 def style_gutter_row(sheet: Worksheet, row: int, start_col: int, end_col: int) -> None:
@@ -495,17 +519,13 @@ def style_summary_data_row(
     row: int,
     start_col: int,
     end_col: int,
-    *,
-    bottom: Side = SIDE_T,
 ) -> None:
-    """Строки данных сводного блока (проект и резервы)."""
+    """Строки данных сводного блока; внешняя рамка — _outline_thick_box."""
     for col in range(start_col, end_col + 1):
         cell = sheet.cell(row=row, column=col)
         cell.fill = FILL_EMPTY
         cell.font = FONT_DATA
-        left = SIDE_M if col == start_col else SIDE_T
-        right = SIDE_M if col == end_col else SIDE_T
-        cell.border = Border(left=left, right=right, top=SIDE_T, bottom=bottom)
+        cell.border = NO_BORDER
         if col in (4, 5, 6, 7, 8, 9):
             cell.alignment = ALIGN_CENTER
             cell.number_format = NUM_FMT_RU
@@ -738,7 +758,7 @@ def _style_flat_data_row(sheet: Worksheet, row: int) -> None:
         cell.border = NO_BORDER
         if col == 3:
             cell.number_format = NUM_FMT_RU
-            cell.alignment = ALIGN_RIGHT
+            cell.alignment = ALIGN_CENTER
         elif col == 6:
             cell.alignment = ALIGN_CENTER
         else:
@@ -752,7 +772,7 @@ def _style_flat_total_row(sheet: Worksheet, row: int) -> None:
         cell.border = NO_BORDER
         if col == 3:
             cell.number_format = NUM_FMT_RU
-            cell.alignment = ALIGN_RIGHT
+            cell.alignment = ALIGN_CENTER
         else:
             cell.alignment = ALIGN_LEFT
 
@@ -835,7 +855,7 @@ def write_reserve_sheet(workbook: Workbook, projects: list[ProjectSummary]) -> d
         for index, level in enumerate(RESERVE_LEVELS, start=5):
             sheet.cell(row=reserves_row, column=index, value=project.approved_reserves.get(level, 0))
         sheet.cell(row=reserves_row, column=9, value=f"=SUM(E{reserves_row}:H{reserves_row})")
-        style_summary_data_row(sheet, reserves_row, 2, 9, bottom=SIDE_M)
+        style_summary_data_row(sheet, reserves_row, 2, 9)
 
         # 1 пустая строка между верхним блоком (резервы) и строкой заголовков таблицы вскрытий
         style_gutter_row(sheet, row + 4, 2, 9)
@@ -911,6 +931,9 @@ def write_reserve_sheet(workbook: Workbook, projects: list[ProjectSummary]) -> d
                 f"Несовпадение числа строк блока проекта {project.project}: ожидалось {detail_last}, запись до {last_written}"
             )
 
+        _outline_thick_box(sheet, row, reserves_row, 2, 9)
+        _set_block_perimeter_thick(sheet, detail_header_row, detail_last, 2, 9)
+
         row = detail_last + 1
 
     set_widths(sheet, compute_detail_column_widths(projects))
@@ -974,6 +997,19 @@ def write_summary_sheet(workbook: Workbook, projects: list[ProjectSummary], summ
         for col in range(3, 10):
             letter = get_column_letter(col)
             sheet.cell(row=index, column=col, value=f"='{TARGET_SHEET_NAME}'!{letter}{source_row}")
+
+    for r in range(2, last_project_row + 1):
+        for col in range(2, 10):
+            sheet.cell(row=r, column=col).border = NO_BORDER
+
+    for sr in range(3, last_project_row + 1):
+        for col in range(4, 10):
+            c = sheet.cell(row=sr, column=col)
+            c.number_format = NUM_FMT_RU
+            c.alignment = ALIGN_CENTER
+
+    _outline_thick_box(sheet, 2, last_project_row, 2, 9)
+
     set_widths(sheet, compute_detail_column_widths(projects))
 
 
