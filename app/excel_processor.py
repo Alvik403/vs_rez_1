@@ -20,6 +20,12 @@ FLAT_SHEET_NAME = "Справка"
 SUMMARY_SHEET_NAME = "СВОД общий"
 RESERVE_LEVELS = ("РП", "РГП", "ЗГД", "ГД")
 
+PLAN_COLUMN_ALIASES = (
+    "Бюджет проекта без резервов",
+    "План по ПД",
+    "План по пд",
+)
+
 
 @dataclass
 class ProjectSummary:
@@ -190,6 +196,50 @@ def safe_cell(sheet: Worksheet, row: int, column: int) -> Cell | None:
     return sheet.cell(row=row, column=column) if column > 0 else None
 
 
+def _pick_plan_column(summary_headers: dict[int, str]) -> int:
+    for alias in PLAN_COLUMN_ALIASES:
+        col = find_column(summary_headers, alias)
+        if col > 0:
+            return col
+    return -1
+
+
+def _row_has_all_reserve_levels(labels: dict[int, str], *, start_col: int = 1) -> bool:
+    return all(find_column(labels, level, start_col) > 0 for level in RESERVE_LEVELS)
+
+
+def _reserve_amounts_for_row(sheet: Worksheet, row: int, reserve_columns: dict[str, int]) -> dict[str, float]:
+    out: dict[str, float] = {level: 0.0 for level in RESERVE_LEVELS}
+    for level, col in reserve_columns.items():
+        if col > 0:
+            out[level] = numeric_value(safe_cell(sheet, row, col)) or 0.0
+    return out
+
+
+def _merge_reserves_from_two_rows(
+    sheet: Worksheet,
+    *,
+    proj_row: int,
+    values_row: int,
+    reserve_columns: dict[str, int],
+    detail_header_row: int,
+) -> dict[str, float]:
+    proj_vals = _reserve_amounts_for_row(sheet, proj_row, reserve_columns)
+
+    if values_row <= proj_row or values_row >= detail_header_row:
+        return proj_vals
+
+    below_vals = _reserve_amounts_for_row(sheet, values_row, reserve_columns)
+    sum_below = sum(below_vals.values())
+    sum_proj = sum(proj_vals.values())
+
+    if sum_below:
+        return below_vals
+    if sum_proj:
+        return proj_vals
+    return below_vals
+
+
 def apply_formula_fallbacks(value_sheet: Worksheet, formula_sheet: Worksheet | None) -> None:
     """Если Excel не сохранил cached value, пробуем посчитать простые формулы сами."""
     if formula_sheet is None:
@@ -218,20 +268,41 @@ def read_project_summaries(sheet: Worksheet, detail_header_row: int) -> dict[str
 
     summary_headers = row_labels(sheet, summary_header_row)
     project_col = find_column(summary_headers, "Наименование проекта")
-    plan_col = find_column(summary_headers, "Бюджет проекта без резервов")
+    plan_col = _pick_plan_column(summary_headers)
     reserve_title_row = find_row(
         sheet,
         lambda labels, row: summary_header_row <= row < detail_header_row
         and any("утвержденные резервы" in value for value in labels.values()),
     )
-    reserve_level_row = reserve_title_row + 1 if reserve_title_row > 0 else summary_header_row + 1
+
+    reserve_level_row = summary_header_row + 1
+    if reserve_title_row > 0 and reserve_title_row + 1 < detail_header_row:
+        cand = reserve_title_row + 1
+        if _row_has_all_reserve_levels(row_labels(sheet, cand)):
+            reserve_level_row = cand
+
+    if not _row_has_all_reserve_levels(row_labels(sheet, reserve_level_row)):
+        for idx in range(summary_header_row + 2, detail_header_row):
+            if _row_has_all_reserve_levels(row_labels(sheet, idx)):
+                reserve_level_row = idx
+                break
+
     reserve_labels = row_labels(sheet, reserve_level_row)
     reserve_title_labels = row_labels(sheet, reserve_title_row) if reserve_title_row > 0 else {}
-    first_reserve_col = min(
-        (col for col, value in reserve_title_labels.items() if "утвержденные резервы" in value),
-        default=1,
-    )
+
+    utv_cols = [
+        col
+        for col, value in reserve_title_labels.items()
+        if normalize(value).find(normalize("утвержденные резервы")) >= 0
+    ]
+    if utv_cols:
+        first_reserve_col = min(utv_cols)
+    else:
+        level_cols = [find_column(reserve_labels, level, 1) for level in RESERVE_LEVELS]
+        first_reserve_col = min((c for c in level_cols if c > 0), default=1)
+
     reserve_columns = {level: find_column(reserve_labels, level, first_reserve_col) for level in RESERVE_LEVELS}
+    reserve_values_row = reserve_level_row + 1 if reserve_level_row + 1 < detail_header_row else reserve_level_row
 
     projects: dict[str, ProjectSummary] = {}
     for row in range(summary_header_row + 1, detail_header_row):
@@ -239,16 +310,21 @@ def read_project_summaries(sheet: Worksheet, detail_header_row: int) -> dict[str
         if not project or "итого" in normalize(project):
             continue
 
-        approved_reserves = {
-            level: numeric_value(safe_cell(sheet, row, col)) or 0
-            for level, col in reserve_columns.items()
-            if col > 0
-        }
-        plan = numeric_value(safe_cell(sheet, row, plan_col)) or 0
-        if not plan and not any(approved_reserves.values()):
-            continue
+        approved_patch = _merge_reserves_from_two_rows(
+            sheet,
+            proj_row=row,
+            values_row=reserve_values_row,
+            reserve_columns=reserve_columns,
+            detail_header_row=detail_header_row,
+        )
 
-        projects[project] = ProjectSummary(project=project, plan=plan, approved_reserves={**{level: 0 for level in RESERVE_LEVELS}, **approved_reserves})
+        plan = numeric_value(safe_cell(sheet, row, plan_col)) or 0.0
+
+        projects[project] = ProjectSummary(
+            project=project,
+            plan=plan,
+            approved_reserves=approved_patch.copy(),
+        )
 
     return projects
 
@@ -270,11 +346,15 @@ def read_openings(sheet: Worksheet, detail_header_row: int, projects: dict[str, 
         "economist_comment": find_column(headers, "Комментарий экономиста"),
     }
 
-    default_project = next(iter(projects.keys()), "") if len(projects) == 1 else ""
+    summary_project_only = next(iter(projects.keys())) if len(projects) == 1 else ""
+
     openings: list[OpeningRow] = []
 
     for row in range(detail_header_row + 1, sheet.max_row + 1):
-        project = text_value(safe_cell(sheet, row, columns["project"])) or default_project
+        if summary_project_only:
+            project = summary_project_only
+        else:
+            project = text_value(safe_cell(sheet, row, columns["project"]))
         cfo = text_value(safe_cell(sheet, row, columns["cfo"]))
         level = text_value(safe_cell(sheet, row, columns["level"]))
         amount = numeric_value(safe_cell(sheet, row, columns["amount"]))
