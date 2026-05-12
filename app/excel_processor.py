@@ -10,7 +10,7 @@ from typing import Any
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.cell.cell import Cell
-from openpyxl.styles import Alignment, Border, Font
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
@@ -190,6 +190,24 @@ def safe_cell(sheet: Worksheet, row: int, column: int) -> Cell | None:
     return sheet.cell(row=row, column=column) if column > 0 else None
 
 
+def apply_formula_fallbacks(value_sheet: Worksheet, formula_sheet: Worksheet | None) -> None:
+    """Если Excel не сохранил cached value, пробуем посчитать простые формулы сами."""
+    if formula_sheet is None:
+        return
+    max_row = min(value_sheet.max_row, formula_sheet.max_row)
+    max_col = min(value_sheet.max_column, formula_sheet.max_column)
+    for row in range(1, max_row + 1):
+        for col in range(1, max_col + 1):
+            value_cell = value_sheet.cell(row=row, column=col)
+            if value_cell.value not in ("", None):
+                continue
+            formula_value = formula_sheet.cell(row=row, column=col).value
+            if isinstance(formula_value, str) and formula_value.startswith("="):
+                fallback = eval_simple_formula(formula_value)
+                if fallback is not None:
+                    value_cell.value = fallback
+
+
 def read_project_summaries(sheet: Worksheet, detail_header_row: int) -> dict[str, ProjectSummary]:
     summary_header_row = find_row(
         sheet,
@@ -288,10 +306,13 @@ def read_openings(sheet: Worksheet, detail_header_row: int, projects: dict[str, 
 
 
 def parse_reserve_workbook(content: bytes, source_file: str) -> ParsedFile:
-    workbook = load_workbook(io.BytesIO(content), data_only=False, keep_vba=True)
+    # data_only=True читает сохранённый Excel результат формул, а не текст формулы.
+    workbook = load_workbook(io.BytesIO(content), data_only=True, keep_vba=True)
+    formula_workbook = load_workbook(io.BytesIO(content), data_only=False, keep_vba=True)
     sheet = find_sheet(workbook, INPUT_SHEET_NAME)
     if sheet is None:
         raise ValueError(f'В файле "{source_file}" не найден лист "{INPUT_SHEET_NAME}".')
+    apply_formula_fallbacks(sheet, find_sheet(formula_workbook, INPUT_SHEET_NAME))
 
     detail_header_row = find_row(
         sheet,
@@ -320,12 +341,28 @@ def clear_or_create_sheet(workbook: Workbook, name: str, index: int | None = Non
     return sheet
 
 
-# Без рамок и заливки — только шрифт/выравнивание и числовой формат.
+BLK = "FF000000"
+SIDE_M = Side(style="medium", color=BLK)
+SIDE_T = Side(style="thin", color=BLK)
+SIDE_H = Side(style="hair", color=BLK)
 NO_BORDER = Border()
+FILL_HEADER = PatternFill(patternType="solid", fgColor="FFD9D9D9")
+FILL_EMPTY = PatternFill(fill_type=None)
+
+CFO_STYLES = {
+    "строители": ("FF9DC3E6", "FF000000"),
+    "уэиэ": ("FFC65911", "FF000000"),
+    "ссп": ("FF000000", "FFFFFFFF"),
+    "срнп": ("FFFF0000", "FF000000"),
+    "сааж": ("FFE2F0D9", "FF000000"),
+    "сср": ("FFFF0000", "FF000000"),
+    "hr": ("FF7030A0", "FF000000"),
+    "сбипр": ("FF000000", "FFFFFFFF"),
+}
 
 # Лист «Справка по резервам »: пустые строки между блоками
 ROWS_BETWEEN_PROJECTS = 3
-ROWS_GAP_DETAIL_HEADER_TO_BODY = 1  # между строкой «ЦФО»… и первой строкой группировки
+ROWS_GAP_DETAIL_HEADER_TO_BODY = 0  # после строки «ЦФО» сразу идёт тело группировки
 
 FONT_TNR = "Times New Roman"
 FONT_HDR = Font(name=FONT_TNR, size=12, bold=True, color="FF000000")
@@ -345,46 +382,67 @@ def style_summary_block_headers(sheet: Worksheet, row: int, start_col: int, end_
     """Верхняя строка сводки."""
     for col in range(start_col, end_col + 1):
         cell = sheet.cell(row=row, column=col)
+        cell.fill = FILL_HEADER
         cell.font = FONT_HDR
         cell.alignment = ALIGN_CENTER
-        cell.border = NO_BORDER
+        left = SIDE_M if col == start_col else SIDE_T
+        right = SIDE_M if col == end_col else SIDE_T
+        cell.border = Border(left=left, right=right, top=SIDE_M, bottom=SIDE_T)
 
 
 def style_summary_reserve_subheader(sheet: Worksheet, row: int, start_col: int, end_col: int) -> None:
     """Строка «План по ПД с резервами» / РП / …"""
     for col in range(start_col, end_col + 1):
         cell = sheet.cell(row=row, column=col)
+        cell.fill = FILL_HEADER
         cell.font = FONT_HDR
         cell.alignment = ALIGN_CENTER
-        cell.border = NO_BORDER
+        left = SIDE_M if col == start_col else SIDE_T
+        right = SIDE_M if col == end_col else SIDE_T
+        cell.border = Border(left=left, right=right, top=SIDE_T, bottom=SIDE_T)
 
 
 def style_gutter_row(sheet: Worksheet, row: int, start_col: int, end_col: int) -> None:
     """Пустая строка-отступ: без рамок (только вертикальный зазор на листе)."""
     for col in range(start_col, end_col + 1):
-        sheet.cell(row=row, column=col).border = NO_BORDER
+        cell = sheet.cell(row=row, column=col)
+        cell.fill = FILL_EMPTY
+        cell.border = NO_BORDER
 
 
-def style_summary_data_row(sheet: Worksheet, row: int, start_col: int, end_col: int) -> None:
+def style_summary_data_row(
+    sheet: Worksheet,
+    row: int,
+    start_col: int,
+    end_col: int,
+    *,
+    bottom: Side = SIDE_T,
+) -> None:
     """Строки данных сводного блока (проект и резервы)."""
     for col in range(start_col, end_col + 1):
         cell = sheet.cell(row=row, column=col)
+        cell.fill = FILL_EMPTY
         cell.font = FONT_DATA
-        cell.border = NO_BORDER
+        left = SIDE_M if col == start_col else SIDE_T
+        right = SIDE_M if col == end_col else SIDE_T
+        cell.border = Border(left=left, right=right, top=SIDE_T, bottom=bottom)
         if col in (4, 5, 6, 7, 8, 9):
-            cell.alignment = ALIGN_RIGHT
+            cell.alignment = ALIGN_CENTER
             cell.number_format = NUM_FMT_RU
         else:
-            cell.alignment = ALIGN_LEFT
+            cell.alignment = ALIGN_CENTER
 
 
 def style_detail_header_template(sheet: Worksheet, row: int, start_col: int, end_col: int) -> None:
     """Строка заголовка таблицы вскрытий."""
     for col in range(start_col, end_col + 1):
         cell = sheet.cell(row=row, column=col)
+        cell.fill = FILL_HEADER
         cell.font = FONT_HDR
         cell.alignment = ALIGN_CENTER
-        cell.border = NO_BORDER
+        left = SIDE_M if col == start_col else SIDE_H
+        right = SIDE_M if col == end_col else SIDE_H
+        cell.border = Border(left=left, right=right, top=SIDE_M, bottom=SIDE_M)
 
 # Колонки детализации: B=ЦФО, D=Уровень, E=Вид работ, F=Сумма, G=Тип, H=Комментарий, I=Дата вскрытия
 COL_CFO, COL_LVL, COL_WORK, COL_AMT, COL_TYPE, COL_COMM, COL_YEAR = 2, 4, 5, 6, 7, 8, 9
@@ -492,15 +550,16 @@ def _style_detail_body_row(
     """Обычная строка детализации."""
     for col in range(start_col, end_col + 1):
         cell = sheet.cell(row=row, column=col)
+        cell.fill = FILL_EMPTY
         cell.font = FONT_DATA
-        cell.border = NO_BORDER
+        left = SIDE_M if col == start_col else SIDE_H
+        right = SIDE_M if col == end_col else SIDE_H
+        cell.border = Border(left=left, right=right, top=SIDE_H, bottom=SIDE_H)
         if col == COL_AMT:
-            cell.alignment = ALIGN_RIGHT
-            cell.number_format = NUM_FMT_RU
-        elif col == COL_YEAR:
             cell.alignment = ALIGN_CENTER
+            cell.number_format = NUM_FMT_RU
         else:
-            cell.alignment = ALIGN_LEFT
+            cell.alignment = ALIGN_CENTER
 
 
 def _style_group_subtotal_row(
@@ -512,19 +571,42 @@ def _style_group_subtotal_row(
     """Итог по ЦФО / по уровню: жирный в ключевых колонках."""
     for col in range(start_col, end_col + 1):
         cell = sheet.cell(row=row, column=col)
+        cell.fill = FILL_EMPTY
         cell.font = FONT_DATA_BOLD if col in (COL_CFO, COL_LVL, COL_AMT) else FONT_DATA
-        cell.border = NO_BORDER
+        left = SIDE_M if col == start_col else SIDE_H
+        right = SIDE_M if col == end_col else SIDE_H
+        cell.border = Border(left=left, right=right, top=SIDE_H, bottom=SIDE_H)
         if col == COL_AMT:
-            cell.alignment = ALIGN_RIGHT
-            cell.number_format = NUM_FMT_RU
-        elif col == COL_YEAR:
             cell.alignment = ALIGN_CENTER
+            cell.number_format = NUM_FMT_RU
         else:
-            cell.alignment = ALIGN_LEFT
+            cell.alignment = ALIGN_CENTER
 
 
 def _apply_detail_outline(sheet: Worksheet, row: int, level: int) -> None:
     sheet.row_dimensions[row].outline_level = level
+
+
+def _cfo_colors(cfo: str) -> tuple[str, str] | None:
+    return CFO_STYLES.get(normalize(cfo).replace(" ", ""))
+
+
+def _apply_cfo_color(sheet: Worksheet, row: int, cfo: str, *, whole_row: bool = False) -> None:
+    colors = _cfo_colors(cfo)
+    if not colors:
+        return
+    fill_rgb, font_rgb = colors
+    start_col, end_col = (2, 9) if whole_row else (2, 3)
+    for col in range(start_col, end_col + 1):
+        cell = sheet.cell(row=row, column=col)
+        cell.fill = PatternFill(patternType="solid", fgColor=fill_rgb)
+        cell.font = Font(name=FONT_TNR, size=11, bold=True, color=font_rgb)
+        cell.alignment = ALIGN_CENTER
+
+
+def _merge_cfo_cells(sheet: Worksheet, row: int) -> None:
+    """В детализации колонка ЦФО визуально занимает B:C."""
+    sheet.merge_cells(start_row=row, start_column=2, end_row=row, end_column=3)
 
 
 def _clear_row_outline(sheet: Worksheet, row: int) -> None:
@@ -650,18 +732,12 @@ def write_reserve_sheet(workbook: Workbook, projects: list[ProjectSummary]) -> d
         sheet.cell(
             row=summary_row,
             column=7,
-            value=(
-                f'=SUMIF(G{detail_first}:G{detail_last},"Удорожание",F{detail_first}:F{detail_last})'
-                f'+SUMIF(G{detail_first}:G{detail_last},"удорожание",F{detail_first}:F{detail_last})'
-            ),
+            value=f'=SUMIF(G{detail_first}:G{detail_last},"Удорожание",F{detail_first}:F{detail_last})',
         )
         sheet.cell(
             row=summary_row,
             column=8,
-            value=(
-                f'=SUMIF(G{detail_first}:G{detail_last},"Техническое",F{detail_first}:F{detail_last})'
-                f'+SUMIF(G{detail_first}:G{detail_last},"техническое",F{detail_first}:F{detail_last})'
-            ),
+            value=f'=SUMIF(G{detail_first}:G{detail_last},"Техническое",F{detail_first}:F{detail_last})',
         )
         sheet.cell(
             row=summary_row,
@@ -679,7 +755,7 @@ def write_reserve_sheet(workbook: Workbook, projects: list[ProjectSummary]) -> d
         for index, level in enumerate(RESERVE_LEVELS, start=5):
             sheet.cell(row=reserves_row, column=index, value=project.approved_reserves.get(level, 0))
         sheet.cell(row=reserves_row, column=9, value=f"=SUM(E{reserves_row}:H{reserves_row})")
-        style_summary_data_row(sheet, reserves_row, 2, 9)
+        style_summary_data_row(sheet, reserves_row, 2, 9, bottom=SIDE_M)
 
         # 1 пустая строка между верхним блоком (резервы) и строкой заголовков таблицы вскрытий
         style_gutter_row(sheet, row + 4, 2, 9)
@@ -689,8 +765,8 @@ def write_reserve_sheet(workbook: Workbook, projects: list[ProjectSummary]) -> d
         for offset, value in enumerate(detail_headers, start=2):
             sheet.cell(row=detail_header_row, column=offset, value=value)
         style_detail_header_template(sheet, detail_header_row, 2, 9)
+        _merge_cfo_cells(sheet, detail_header_row)
 
-        # 1 пустая строка между заголовком таблицы и телом группировки
         for k in range(ROWS_GAP_DETAIL_HEADER_TO_BODY):
             gap_r = detail_header_row + 1 + k
             style_gutter_row(sheet, gap_r, 2, 9)
@@ -701,6 +777,7 @@ def write_reserve_sheet(workbook: Workbook, projects: list[ProjectSummary]) -> d
             sheet.cell(row=r, column=COL_CFO, value="(нет строк вскрытия)")
             sheet.cell(row=r, column=COL_AMT, value=0)
             _style_detail_body_row(sheet, r, 2, 9)
+            _merge_cfo_cells(sheet, r)
             _apply_detail_outline(sheet, r, 0)
             r += 1
         else:
@@ -722,6 +799,8 @@ def write_reserve_sheet(workbook: Workbook, projects: list[ProjectSummary]) -> d
                         sheet.cell(row=r, column=COL_COMM, value=opening.economist_comment)
                         sheet.cell(row=r, column=COL_YEAR, value=opening.date_year)
                         _style_detail_body_row(sheet, r, 2, 9)
+                        _apply_cfo_color(sheet, r, opening.cfo)
+                        _merge_cfo_cells(sheet, r)
                         _apply_detail_outline(sheet, r, 2)
                         r += 1
                     last_detail = r - 1
@@ -733,6 +812,8 @@ def write_reserve_sheet(workbook: Workbook, projects: list[ProjectSummary]) -> d
                     else:
                         sheet.cell(row=sub_row, column=COL_AMT, value=0)
                     _style_group_subtotal_row(sheet, sub_row, 2, 9)
+                    _apply_cfo_color(sheet, sub_row, cfo)
+                    _merge_cfo_cells(sheet, sub_row)
                     _apply_detail_outline(sheet, sub_row, 1)
                     subtotal_row_refs.append(sub_row)
 
@@ -740,6 +821,8 @@ def write_reserve_sheet(workbook: Workbook, projects: list[ProjectSummary]) -> d
                 sheet.cell(row=cfo_row, column=COL_CFO, value=cfo)
                 sheet.cell(row=cfo_row, column=COL_AMT, value=cfo_formula)
                 _style_group_subtotal_row(sheet, cfo_row, 2, 9)
+                _apply_cfo_color(sheet, cfo_row, cfo, whole_row=True)
+                _merge_cfo_cells(sheet, cfo_row)
                 _apply_detail_outline(sheet, cfo_row, 0)
 
         last_written = r - 1

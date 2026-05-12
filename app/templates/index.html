@@ -10,11 +10,11 @@
     <main class="page">
       <div class="upload-wrap">
         <form id="uploadForm" class="card" method="post" enctype="multipart/form-data">
-          <label class="dropzone">
+          <div id="dropzone" class="dropzone" role="button" tabindex="0">
             <input id="files" name="files" type="file" accept=".xlsx,.xlsm" multiple required />
             <strong>Файлы вскрытия резервов</strong>
-            <span>Можно выбрать сразу несколько `.xlsx` или `.xlsm`.</span>
-          </label>
+            <span>Выберите, перетащите или вставьте через Ctrl+V файлы `.xlsx` / `.xlsm`.</span>
+          </div>
 
           <div class="actions">
             <button id="submitButton" type="submit">Собрать и скачать</button>
@@ -26,6 +26,6 @@
       </div>
     </main>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=3"></script>
   </body>
 </html>
