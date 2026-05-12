@@ -11,8 +11,7 @@ from typing import Any
 from openpyxl import Workbook, load_workbook
 from openpyxl.cell.cell import Cell
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import column_index_from_string, get_column_letter
-from openpyxl.utils.cell import coordinate_from_string, range_boundaries
+from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 INPUT_SHEET_NAME = "Вскрытие резервов"
@@ -121,165 +120,6 @@ def eval_simple_formula(formula: str) -> float | None:
     return float(result) if isinstance(result, (int, float)) else None
 
 
-def _unquote_sheet_name(raw: str | None) -> str:
-    if not raw:
-        return ""
-    return raw.replace("''", "'").strip()
-
-
-SUM_REF_RE = re.compile(
-    r"(?:'((?:''|[^'])*)'|([^!]+))!(\$?[A-Za-z]+\$?\d+)(?::(\$?[A-Za-z]+\$?\d+))?",
-    re.IGNORECASE,
-)
-
-LOCAL_RANGE_RE = re.compile(
-    r"^(\$?[A-Za-z]+\$?\d+)(?::(\$?[A-Za-z]+\$?\d+))?$",
-    re.IGNORECASE,
-)
-
-
-def _a1_range_bounds(start_a1: str, end_a1: str | None) -> tuple[int, int, int, int]:
-    start_a1 = start_a1.replace("$", "")
-    end_a1 = (end_a1 or start_a1).replace("$", "")
-    if ":" in start_a1:
-        return range_boundaries(start_a1)
-    scol_letter, srow = coordinate_from_string(start_a1)
-    ecol_letter, erow = coordinate_from_string(end_a1)
-    c1, c2 = column_index_from_string(scol_letter), column_index_from_string(ecol_letter)
-    return min(c1, c2), min(srow, erow), max(c1, c2), max(srow, erow)
-
-
-def _sum_cell_region(
-    ws_values: Worksheet,
-    ws_formula: Worksheet | None,
-    min_col: int,
-    min_row: int,
-    max_col: int,
-    max_row: int,
-    value_wb: Workbook,
-    formula_wb: Workbook | None,
-    depth: int,
-) -> float:
-    total = 0.0
-    for r in range(min_row, max_row + 1):
-        for c in range(min_col, max_col + 1):
-            cell_v = ws_values.cell(row=r, column=c)
-            nv = numeric_value(cell_v)
-            if nv is not None:
-                total += nv
-                continue
-            if formula_wb is None or ws_formula is None or depth >= 10:
-                continue
-            fv = ws_formula.cell(row=r, column=c).value
-            if isinstance(fv, str) and fv.strip().startswith("="):
-                sub = eval_sum_formula(fv.strip(), value_wb, formula_wb, ws_values, depth + 1)
-                if sub is not None:
-                    total += sub
-    return total
-
-
-def _split_sum_arguments(inner: str) -> list[str]:
-    """Аргументы SUM: в RU часто ';', в EN — ','; не режем по разделителю внутри '…'."""
-    parts: list[str] = []
-    buf: list[str] = []
-    in_quote = False
-    i = 0
-    while i < len(inner):
-        ch = inner[i]
-        if ch == "'":
-            if in_quote and i + 1 < len(inner) and inner[i + 1] == "'":
-                buf.append("''")
-                i += 2
-                continue
-            in_quote = not in_quote
-            buf.append(ch)
-        elif ch in ";," and not in_quote:
-            seg = "".join(buf).strip()
-            if seg:
-                parts.append(seg)
-            buf = []
-        else:
-            buf.append(ch)
-        i += 1
-    tail = "".join(buf).strip()
-    if tail:
-        parts.append(tail)
-    return parts
-
-
-def eval_sum_formula(
-    formula: str,
-    value_wb: Workbook,
-    formula_wb: Workbook | None,
-    current_ws: Worksheet | None = None,
-    depth: int = 0,
-) -> float | None:
-    """Вычисляет =SUM / =СУММ(...) по ссылкам на листы и диапазоны (в т.ч. несколько через ; или ,)."""
-    if depth > 10:
-        return None
-    s = formula.strip()
-    if not s.startswith("="):
-        s = "=" + s
-    fn_m = re.match(r"^\s*=\s*(?:SUM|СУММ)\s*\(\s*(.+)\s*\)\s*$", s, flags=re.IGNORECASE | re.DOTALL)
-    if not fn_m:
-        return None
-    inner = fn_m.group(1).strip()
-    total = 0.0
-    found = False
-    for part in _split_sum_arguments(inner):
-        compact = part.replace(" ", "")
-        if not compact:
-            continue
-        m = SUM_REF_RE.fullmatch(compact)
-        if m:
-            found = True
-            sheet_raw_q, sheet_raw_uq = m.group(1), m.group(2)
-            sheet_name = _unquote_sheet_name(sheet_raw_q) or (sheet_raw_uq or "").strip()
-            start_a1, end_a1_part = m.group(3), m.group(4)
-            ws_v = find_sheet(value_wb, sheet_name)
-            if ws_v is None:
-                continue
-            ws_f = find_sheet(formula_wb, sheet_name) if formula_wb else None
-            min_col, min_row, max_col, max_row = _a1_range_bounds(start_a1, end_a1_part)
-            total += _sum_cell_region(ws_v, ws_f, min_col, min_row, max_col, max_row, value_wb, formula_wb, depth)
-            continue
-        if current_ws is not None:
-            lm = LOCAL_RANGE_RE.fullmatch(compact)
-            if lm:
-                found = True
-                min_col, min_row, max_col, max_row = _a1_range_bounds(lm.group(1), lm.group(2))
-                ws_f = formula_wb[current_ws.title] if formula_wb and current_ws.title in formula_wb.sheetnames else None
-                total += _sum_cell_region(current_ws, ws_f, min_col, min_row, max_col, max_row, value_wb, formula_wb, depth)
-    return total if found else None
-
-
-def opening_totals_by_category(project: ProjectSummary) -> tuple[float, float, float, float, float]:
-    """Итоги как на листе «Справка»: сумма по трём типам; колонка «2025» по году вскрытия."""
-    ideology = expensive = technical = year2025 = 0.0
-    for o in project.openings:
-        amt = float(o.amount)
-        typ = (o.opening_type or "").strip()
-        if typ == "Идеологическое изменение":
-            ideology += amt
-        elif typ == "Удорожание":
-            expensive += amt
-        elif typ == "Техническое":
-            technical += amt
-        dy = o.date_year
-        try:
-            y_int = int(float(dy)) if dy not in ("", None) else None
-        except (TypeError, ValueError):
-            y_int = None
-        if y_int == 2025:
-            year2025 += amt
-    block_total = ideology + expensive + technical
-    return block_total, ideology, expensive, technical, year2025
-
-
-def approved_reserves_total(project: ProjectSummary) -> float:
-    return float(sum(project.approved_reserves.get(lv, 0) for lv in RESERVE_LEVELS))
-
-
 def date_year(value: Any) -> int | str:
     if value in ("", None):
         return ""
@@ -350,13 +190,8 @@ def safe_cell(sheet: Worksheet, row: int, column: int) -> Cell | None:
     return sheet.cell(row=row, column=column) if column > 0 else None
 
 
-def apply_formula_fallbacks(
-    value_sheet: Worksheet,
-    formula_sheet: Worksheet | None,
-    value_wb: Workbook,
-    formula_wb: Workbook | None,
-) -> None:
-    """Если Excel не сохранил кэш значений — считаем простые выражения и СУММ/SUM по ссылкам на листы."""
+def apply_formula_fallbacks(value_sheet: Worksheet, formula_sheet: Worksheet | None) -> None:
+    """Если Excel не сохранил cached value, пробуем посчитать простые формулы сами."""
     if formula_sheet is None:
         return
     max_row = min(value_sheet.max_row, formula_sheet.max_row)
@@ -369,13 +204,8 @@ def apply_formula_fallbacks(
             formula_value = formula_sheet.cell(row=row, column=col).value
             if isinstance(formula_value, str) and formula_value.startswith("="):
                 fallback = eval_simple_formula(formula_value)
-                if fallback is None:
-                    fb_sum = eval_sum_formula(formula_value, value_wb, formula_wb, value_sheet)
-                    fallback = fb_sum if fb_sum is not None else None
                 if fallback is not None:
                     value_cell.value = fallback
-                    if isinstance(fallback, (int, float)):
-                        value_cell.number_format = NUM_FMT_RU
 
 
 def read_project_summaries(sheet: Worksheet, detail_header_row: int) -> dict[str, ProjectSummary]:
@@ -482,7 +312,7 @@ def parse_reserve_workbook(content: bytes, source_file: str) -> ParsedFile:
     sheet = find_sheet(workbook, INPUT_SHEET_NAME)
     if sheet is None:
         raise ValueError(f'В файле "{source_file}" не найден лист "{INPUT_SHEET_NAME}".')
-    apply_formula_fallbacks(sheet, find_sheet(formula_workbook, INPUT_SHEET_NAME), workbook, formula_workbook)
+    apply_formula_fallbacks(sheet, find_sheet(formula_workbook, INPUT_SHEET_NAME))
 
     detail_header_row = find_row(
         sheet,
@@ -531,7 +361,7 @@ CFO_STYLES = {
 }
 
 # Лист «Справка по резервам »: пустые строки между блоками
-ROWS_BETWEEN_PROJECTS = 3
+ROWS_BETWEEN_PROJECTS = 1
 ROWS_GAP_DETAIL_HEADER_TO_BODY = 0  # после строки «ЦФО» сразу идёт тело группировки
 
 FONT_TNR = "Times New Roman"
@@ -539,10 +369,7 @@ FONT_HDR = Font(name=FONT_TNR, size=12, bold=True, color="FF000000")
 FONT_DATA = Font(name=FONT_TNR, size=11, bold=False, color="FF000000")
 FONT_DATA_BOLD = Font(name=FONT_TNR, size=11, bold=True, color="FF000000")
 
-# Десятичные в formatCode — точка (.00 → в Excel RU отображается запятая).
-# Явное группирование триадами: шаблон # ##0 даёт ошибку вида «67781 716,57», нужно # ### ### … ##0
-NUM_FMT_RU = "# ### ### ### ##0.00"
-NUM_FMT_YEAR = "0"
+NUM_FMT_RU = "# ##0,00"
 ALIGN_LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
 ALIGN_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 ALIGN_RIGHT = Alignment(horizontal="right", vertical="center", wrap_text=True)
@@ -731,9 +558,6 @@ def _style_detail_body_row(
         if col == COL_AMT:
             cell.alignment = ALIGN_CENTER
             cell.number_format = NUM_FMT_RU
-        elif col == COL_YEAR:
-            cell.alignment = ALIGN_CENTER
-            cell.number_format = NUM_FMT_YEAR
         else:
             cell.alignment = ALIGN_CENTER
 
@@ -778,8 +602,6 @@ def _apply_cfo_color(sheet: Worksheet, row: int, cfo: str, *, whole_row: bool = 
         cell.fill = PatternFill(patternType="solid", fgColor=fill_rgb)
         cell.font = Font(name=FONT_TNR, size=11, bold=True, color=font_rgb)
         cell.alignment = ALIGN_CENTER
-        if col == COL_AMT:
-            cell.number_format = NUM_FMT_RU
 
 
 def _merge_cfo_cells(sheet: Worksheet, row: int) -> None:
@@ -838,7 +660,6 @@ def _style_flat_data_row(sheet: Worksheet, row: int) -> None:
             cell.number_format = NUM_FMT_RU
             cell.alignment = ALIGN_RIGHT
         elif col == 6:
-            cell.number_format = NUM_FMT_YEAR
             cell.alignment = ALIGN_CENTER
         else:
             cell.alignment = ALIGN_LEFT
@@ -861,9 +682,10 @@ def set_widths(sheet: Worksheet, widths: dict[str, float]) -> None:
         sheet.column_dimensions[column].width = width
 
 
-def write_reserve_sheet(workbook: Workbook, projects: list[ProjectSummary]) -> None:
+def write_reserve_sheet(workbook: Workbook, projects: list[ProjectSummary]) -> dict[str, int]:
     sheet = clear_or_create_sheet(workbook, TARGET_SHEET_NAME, 0)
     _set_outline_summary_above(sheet)
+    summary_rows: dict[str, int] = {}
     row = 3
 
     for project in projects:
@@ -882,9 +704,7 @@ def write_reserve_sheet(workbook: Workbook, projects: list[ProjectSummary]) -> N
         detail_header_row = row + 5
         detail_first = detail_header_row + 1 + ROWS_GAP_DETAIL_HEADER_TO_BODY
         detail_last = detail_first + n_detail - 1
-        block_total, ideology, expensive, technical, year2025 = opening_totals_by_category(project)
-        ap_total = approved_reserves_total(project)
-        plan_v = float(project.plan)
+        summary_rows[project.project] = summary_row
 
         headers = [
             "Наименование проекта",
@@ -902,12 +722,28 @@ def write_reserve_sheet(workbook: Workbook, projects: list[ProjectSummary]) -> N
 
         sheet.cell(row=summary_row, column=2, value=project.project)
         sheet.cell(row=summary_row, column=3, value=project.description)
-        sheet.cell(row=summary_row, column=4, value=plan_v)
-        sheet.cell(row=summary_row, column=5, value=block_total)
-        sheet.cell(row=summary_row, column=6, value=ideology)
-        sheet.cell(row=summary_row, column=7, value=expensive)
-        sheet.cell(row=summary_row, column=8, value=technical)
-        sheet.cell(row=summary_row, column=9, value=year2025)
+        sheet.cell(row=summary_row, column=4, value=project.plan)
+        sheet.cell(row=summary_row, column=5, value=f"=SUM(F{summary_row}:H{summary_row})")
+        sheet.cell(
+            row=summary_row,
+            column=6,
+            value=f'=SUMIF(G{detail_first}:G{detail_last},"Идеологическое изменение",F{detail_first}:F{detail_last})',
+        )
+        sheet.cell(
+            row=summary_row,
+            column=7,
+            value=f'=SUMIF(G{detail_first}:G{detail_last},"Удорожание",F{detail_first}:F{detail_last})',
+        )
+        sheet.cell(
+            row=summary_row,
+            column=8,
+            value=f'=SUMIF(G{detail_first}:G{detail_last},"Техническое",F{detail_first}:F{detail_last})',
+        )
+        sheet.cell(
+            row=summary_row,
+            column=9,
+            value=f"=SUMIF(I{detail_first}:I{detail_last},2025,F{detail_first}:F{detail_last})",
+        )
         style_summary_data_row(sheet, summary_row, 2, 9)
 
         reserve_headers = ["План по ПД с резервами", "РП", "РГП", "ЗГД", "ГД", "Итого резервы"]
@@ -915,10 +751,10 @@ def write_reserve_sheet(workbook: Workbook, projects: list[ProjectSummary]) -> N
             sheet.cell(row=row + 2, column=offset, value=value)
         style_summary_reserve_subheader(sheet, row + 2, 2, 9)
 
-        sheet.cell(row=reserves_row, column=4, value=plan_v + ap_total)
+        sheet.cell(row=reserves_row, column=4, value=f"=D{summary_row}+I{reserves_row}")
         for index, level in enumerate(RESERVE_LEVELS, start=5):
-            sheet.cell(row=reserves_row, column=index, value=float(project.approved_reserves.get(level, 0)))
-        sheet.cell(row=reserves_row, column=9, value=ap_total)
+            sheet.cell(row=reserves_row, column=index, value=project.approved_reserves.get(level, 0))
+        sheet.cell(row=reserves_row, column=9, value=f"=SUM(E{reserves_row}:H{reserves_row})")
         style_summary_data_row(sheet, reserves_row, 2, 9, bottom=SIDE_M)
 
         # 1 пустая строка между верхним блоком (резервы) и строкой заголовков таблицы вскрытий
@@ -939,7 +775,7 @@ def write_reserve_sheet(workbook: Workbook, projects: list[ProjectSummary]) -> N
         r = detail_first
         if not project.openings:
             sheet.cell(row=r, column=COL_CFO, value="(нет строк вскрытия)")
-            sheet.cell(row=r, column=COL_AMT, value=0.0)
+            sheet.cell(row=r, column=COL_AMT, value=0)
             _style_detail_body_row(sheet, r, 2, 9)
             _merge_cfo_cells(sheet, r)
             _apply_detail_outline(sheet, r, 0)
@@ -948,19 +784,17 @@ def write_reserve_sheet(workbook: Workbook, projects: list[ProjectSummary]) -> N
             for cfo, groups in structure:
                 cfo_row = r
                 r += 1
-                cfo_amount_total = 0.0
+                subtotal_row_refs: list[int] = []
 
                 for level_name, items in groups:
                     sub_row = r
                     r += 1
                     first_detail = r
-                    level_sum = 0.0
                     for opening in items:
-                        level_sum += float(opening.amount)
                         sheet.cell(row=r, column=COL_CFO, value=opening.cfo)
                         sheet.cell(row=r, column=COL_LVL, value=opening.level)
                         sheet.cell(row=r, column=COL_WORK, value=opening.work_type)
-                        sheet.cell(row=r, column=COL_AMT, value=float(opening.amount))
+                        sheet.cell(row=r, column=COL_AMT, value=opening.amount)
                         sheet.cell(row=r, column=COL_TYPE, value=opening.opening_type)
                         sheet.cell(row=r, column=COL_COMM, value=opening.economist_comment)
                         sheet.cell(row=r, column=COL_YEAR, value=opening.date_year)
@@ -973,15 +807,19 @@ def write_reserve_sheet(workbook: Workbook, projects: list[ProjectSummary]) -> N
 
                     sheet.cell(row=sub_row, column=COL_CFO, value=cfo)
                     sheet.cell(row=sub_row, column=COL_LVL, value=level_name)
-                    sheet.cell(row=sub_row, column=COL_AMT, value=level_sum if first_detail <= last_detail else 0.0)
+                    if first_detail <= last_detail:
+                        sheet.cell(row=sub_row, column=COL_AMT, value=f"=SUM(F{first_detail}:F{last_detail})")
+                    else:
+                        sheet.cell(row=sub_row, column=COL_AMT, value=0)
                     _style_group_subtotal_row(sheet, sub_row, 2, 9)
                     _apply_cfo_color(sheet, sub_row, cfo)
                     _merge_cfo_cells(sheet, sub_row)
                     _apply_detail_outline(sheet, sub_row, 1)
-                    cfo_amount_total += level_sum
+                    subtotal_row_refs.append(sub_row)
 
+                cfo_formula = "=" + "+".join(f"F{x}" for x in subtotal_row_refs) if subtotal_row_refs else "=0"
                 sheet.cell(row=cfo_row, column=COL_CFO, value=cfo)
-                sheet.cell(row=cfo_row, column=COL_AMT, value=cfo_amount_total)
+                sheet.cell(row=cfo_row, column=COL_AMT, value=cfo_formula)
                 _style_group_subtotal_row(sheet, cfo_row, 2, 9)
                 _apply_cfo_color(sheet, cfo_row, cfo, whole_row=True)
                 _merge_cfo_cells(sheet, cfo_row)
@@ -996,6 +834,7 @@ def write_reserve_sheet(workbook: Workbook, projects: list[ProjectSummary]) -> N
         row = detail_last + 1
 
     set_widths(sheet, compute_detail_column_widths(projects))
+    return summary_rows
 
 
 def write_flat_sheet(workbook: Workbook, openings: list[OpeningRow]) -> None:
@@ -1003,6 +842,7 @@ def write_flat_sheet(workbook: Workbook, openings: list[OpeningRow]) -> None:
     headers = ["Уровень резерва", "Вид работ", "Сумма вскрытия", "Тип вскрытия", "Комментарий", "Дата вскрытия", "ЦФО"]
     sheet.append(headers)
     style_detail_header_template(sheet, 1, 1, len(headers))
+    first_data = 2
     for opening in openings:
         sheet.append(
             [
@@ -1020,12 +860,12 @@ def write_flat_sheet(workbook: Workbook, openings: list[OpeningRow]) -> None:
         last_data = sheet.max_row
         total_row = last_data + 1
         sheet.cell(row=total_row, column=1, value="ИТОГО")
-        sheet.cell(row=total_row, column=3, value=float(sum(o.amount for o in openings)))
+        sheet.cell(row=total_row, column=3, value=f"=SUBTOTAL(9,C{first_data}:C{last_data})")
         _style_flat_total_row(sheet, total_row)
     set_widths(sheet, compute_flat_column_widths(openings))
 
 
-def write_summary_sheet(workbook: Workbook, projects: list[ProjectSummary]) -> None:
+def write_summary_sheet(workbook: Workbook, projects: list[ProjectSummary], summary_rows: dict[str, int]) -> None:
     sheet = clear_or_create_sheet(workbook, SUMMARY_SHEET_NAME)
     sheet.cell(row=1, column=2, value="добавить описание проекта + техническое вскрытие")
     headers = [
@@ -1042,36 +882,18 @@ def write_summary_sheet(workbook: Workbook, projects: list[ProjectSummary]) -> N
         sheet.cell(row=2, column=offset, value=value)
     style_summary_block_headers(sheet, 2, 2, 9)
 
+    last_project_row = len(projects) + 3
     sheet.cell(row=3, column=2, value="ИТОГО:")
-    tot_plan = tot_bt = tot_ide = tot_exp = tot_tech = tot_y25 = 0.0
+    for col in range(4, 10):
+        letter = get_column_letter(col)
+        sheet.cell(row=3, column=col, value=f"=SUBTOTAL(9,{letter}4:{letter}{last_project_row})")
 
     for index, project in enumerate(projects, start=4):
-        bt, ide, exp, tech, y25 = opening_totals_by_category(project)
-        plan_v = float(project.plan)
+        source_row = summary_rows[project.project]
         sheet.cell(row=index, column=2, value=project.project)
-        sheet.cell(row=index, column=3, value=project.description)
-        sheet.cell(row=index, column=4, value=plan_v)
-        sheet.cell(row=index, column=5, value=bt)
-        sheet.cell(row=index, column=6, value=ide)
-        sheet.cell(row=index, column=7, value=exp)
-        sheet.cell(row=index, column=8, value=tech)
-        sheet.cell(row=index, column=9, value=y25)
-        style_summary_data_row(sheet, index, 2, 9)
-        tot_plan += plan_v
-        tot_bt += bt
-        tot_ide += ide
-        tot_exp += exp
-        tot_tech += tech
-        tot_y25 += y25
-
-    sheet.cell(row=3, column=4, value=tot_plan)
-    sheet.cell(row=3, column=5, value=tot_bt)
-    sheet.cell(row=3, column=6, value=tot_ide)
-    sheet.cell(row=3, column=7, value=tot_exp)
-    sheet.cell(row=3, column=8, value=tot_tech)
-    sheet.cell(row=3, column=9, value=tot_y25)
-    style_summary_data_row(sheet, 3, 2, 9)
-
+        for col in range(3, 10):
+            letter = get_column_letter(col)
+            sheet.cell(row=index, column=col, value=f"='{TARGET_SHEET_NAME}'!{letter}{source_row}")
     set_widths(sheet, compute_detail_column_widths(projects))
 
 
@@ -1112,9 +934,11 @@ def build_consolidated_workbook(
     workbook = Workbook()
     workbook.remove(workbook.active)
 
-    write_reserve_sheet(workbook, projects)
+    summary_rows = write_reserve_sheet(workbook, projects)
     write_flat_sheet(workbook, openings)
-    write_summary_sheet(workbook, projects)
+    write_summary_sheet(workbook, projects, summary_rows)
+    workbook.calculation.fullCalcOnLoad = True
+    workbook.calculation.forceFullCalc = True
 
     output = io.BytesIO()
     workbook.save(output)
