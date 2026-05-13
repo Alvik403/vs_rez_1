@@ -678,7 +678,18 @@ def _apply_detail_outline(sheet: Worksheet, row: int, level: int) -> None:
 
 
 def _cfo_colors(cfo: str) -> tuple[str, str] | None:
-    return CFO_STYLES.get(normalize(cfo).replace(" ", ""))
+    """Цвет строки ЦФО: точное совпадение без пробелов, иначе вхождение ключа во всей строке (напр. «УЭиЭ (123)»)."""
+    compact = normalize(cfo).replace(" ", "")
+    if not compact:
+        return None
+    hit = CFO_STYLES.get(compact)
+    if hit:
+        return hit
+    for key in sorted(CFO_STYLES, key=len, reverse=True):
+        nk = normalize(key).replace(" ", "")
+        if len(nk) >= 2 and nk in compact:
+            return CFO_STYLES[key]
+    return None
 
 
 def _apply_cfo_color(sheet: Worksheet, row: int, cfo: str, *, whole_row: bool = False) -> None:
