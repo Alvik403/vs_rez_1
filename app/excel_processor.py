@@ -433,6 +433,8 @@ FILL_EMPTY = PatternFill(fill_type=None)
 CFO_STYLES = {
     "строители": ("FF9DC3E6", "FF000000"),
     "уэиэ": ("FFC65911", "FF000000"),
+    "укс": ("FF9CC2E5", "FF000000"),
+    "угп": ("FFC45911", "FF000000"),
     "ссп": ("FF000000", "FFFFFFFF"),
     "срнп": ("FFFF0000", "FF000000"),
     "сааж": ("FFE2F0D9", "FF000000"),
